@@ -1,4 +1,6 @@
 import bpy
+import os
+from .utils import get_python_path, get_megasam_root
 
 class VIEW3D_PT_megasam_panel(bpy.types.Panel):
     bl_label = "CEB MegaSam"
@@ -11,42 +13,133 @@ class VIEW3D_PT_megasam_panel(bpy.types.Panel):
         layout = self.layout
         scene = context.scene
         
-        # Access the addon preferences
-        addon_name = __package__.split('.')[0] # Get the top level package name
+        # Access addon preferences
+        addon_name = __package__.split('.')[0]
         prefs = context.preferences.addons[addon_name].preferences
 
-        # Environment Section
+        # 1. Environment Section
         box = layout.box()
-        box.label(text="Environment", icon='PROPERTIES')
-        box.prop(prefs, "python_path", text="Python Path")
-        box.prop(prefs, "megasam_root_path", text="MegaSam Root")
+        box.label(text="Environment", icon='PREFERENCES')
+        
+        col = box.column(align=True)
+        col.prop(prefs, "python_path", text="Python")
+        if not prefs.python_path:
+            auto_py = get_python_path(context)
+            if auto_py and os.path.exists(auto_py):
+                col.label(text=f"Auto: {os.path.basename(os.path.dirname(auto_py))}\\python.exe", icon='CHECKMARK')
+            else:
+                col.label(text="Python not found", icon='ERROR')
+                
+        col.separator()
+        col.prop(prefs, "megasam_root_path", text="MegaSam")
+        if not prefs.megasam_root_path:
+            auto_root = get_megasam_root(context)
+            if auto_root and os.path.exists(auto_root):
+                col.label(text=f"Auto: {os.path.basename(auto_root)}", icon='CHECKMARK')
+            else:
+                col.label(text="MegaSam root not found", icon='ERROR')
         
         layout.separator()
         
-        # Processing Section
+        # 2. Input Video Section
         box = layout.box()
-        box.label(text="Processing")
+        box.label(text="Input Video", icon='FILE_MOVIE')
         box.prop(scene, "megasam_video_path", text="Video File")
         box.prop(scene, "megasam_scene_name", text="Scene Name")
         
         if scene.megasam_video_frames > 0:
             row = box.column(align=True)
-            row.label(text=f"Resolution: {scene.megasam_video_width} x {scene.megasam_video_height}", icon='SCENE_DATA')
-            row.label(text=f"Frames: {scene.megasam_video_frames}", icon='IMAGE_DATA')
+            row.label(text=f"Original: {scene.megasam_video_width}x{scene.megasam_video_height} | {scene.megasam_video_frames} Frames", icon='IMAGE_DATA')
         
-        row = box.row()
-        row.prop(scene, "megasam_use_batch", text="Enable Batching")
+        # VSE Controls
+        vse_sub = box.box()
+        vse_sub.label(text="Video Sequence Editor (VSE)", icon='SEQUENCE')
+        vcol = vse_sub.column(align=True)
+        vcol.prop(scene, "megasam_vse_view_mode", text="VSE Mode")
+        vcol.prop(scene, "megasam_vse_clear_existing", text="Clear VSE Strips before Load")
+        
+        vrow = vcol.row(align=True)
+        vrow.operator("megasam.open_vse", icon='WINDOW', text="Open VSE")
+        vrow.operator("megasam.load_video_vse", icon='IMPORT', text="Open Video in VSE")
+        
+        # 3. Performance & Speed Optimization Controls
+        sub = box.box()
+        sub.label(text="Performance & Speed Optimization", icon='MODIFIER')
+        
+        col = sub.column(align=True)
+        col.prop(scene, "megasam_res_preset", text="Resolution")
+        if scene.megasam_res_preset == 'CUSTOM':
+            col.prop(scene, "megasam_target_width", text="Width (px)")
+        else:
+            col.label(text=f"Processing Width: {scene.megasam_target_width} px", icon='DRIVER')
+        
+        col.separator()
+        col.prop(scene, "megasam_depth_encoder", text="Depth Model")
+        
+        col.separator()
+        # CVD / Tracking-only mode
+        col.prop(scene, "megasam_skip_cvd", text="Tracking Only (Fast / Skip CVD)")
+        if not scene.megasam_skip_cvd:
+            col.prop(scene, "megasam_cvd_iters", text="CVD Iterations")
+        else:
+            col.label(text="Skips RAFT flow & dense CVD optimization", icon='INFO')
+        
+        sub.separator()
+        
+        # Frame Range
+        col = sub.column(align=True)
+        col.prop(scene, "megasam_use_frame_range", text="Trim Frame Range")
+        if scene.megasam_use_frame_range:
+            row = col.row(align=True)
+            row.prop(scene, "megasam_start_frame", text="Start")
+            row.prop(scene, "megasam_end_frame", text="End")
+            col.operator("megasam.set_range_from_timeline", icon='TIME', text="From Blender Timeline")
+            
+            if scene.megasam_end_frame > scene.megasam_start_frame:
+                frame_count = scene.megasam_end_frame - scene.megasam_start_frame
+                col.label(text=f"Processing {frame_count} frames", icon='INFO')
+        
+        sub.separator()
+        
+        # Batching
+        col = sub.column(align=True)
+        col.prop(scene, "megasam_use_batch", text="Enable Batching (Low VRAM)")
         if scene.megasam_use_batch:
-            row.prop(scene, "megasam_batch_size", text="Size")
+            col.prop(scene, "megasam_batch_size", text="Batch Size")
+            
+            total_f = scene.megasam_video_frames
+            if scene.megasam_use_frame_range and scene.megasam_end_frame > scene.megasam_start_frame:
+                total_f = scene.megasam_end_frame - scene.megasam_start_frame
+                
+            if total_f > 0 and scene.megasam_batch_size > 0:
+                batch_count = (total_f + scene.megasam_batch_size - 1) // scene.megasam_batch_size
+                col.label(text=f"Splits into ~{batch_count} batches (auto-stitched)", icon='FORCE_CHARGE')
+        
+        sub.separator()
+        sub.prop(scene, "megasam_low_vram", text="CUDA Memory Allocator Opt")
+        
+        # 4. Advanced SLAM Backend Controls
+        sub.separator()
+        adv_box = sub.box()
+        adv_box.prop(scene, "megasam_show_advanced", icon='TRIA_DOWN' if scene.megasam_show_advanced else 'TRIA_RIGHT', text="Advanced SLAM (DROID) Settings", emboss=False)
+        if scene.megasam_show_advanced:
+            acol = adv_box.column(align=True)
+            acol.prop(scene, "megasam_stride", text="Tracking Stride")
+            if scene.megasam_stride > 1:
+                acol.label(text=f"Tracks every {scene.megasam_stride} frames (50-65% faster)", icon='INFO')
+            acol.prop(scene, "megasam_frontend_iters", text="Frontend BA Iters")
+            acol.prop(scene, "megasam_backend_iters", text="Backend BA Iters")
+            acol.prop(scene, "megasam_buffer", text="Keyframe Buffer")
+            acol.prop(scene, "megasam_keyframe_thresh", text="Keyframe Thresh")
+
+        layout.separator()
+        
+        # 5. Run Button
+        layout.operator("megasam.run_pipeline", icon='PLAY', text="Run MegaSam Pipeline")
         
         layout.separator()
         
-        # Run Button
-        layout.operator("megasam.run_pipeline", icon='PLAY', text="Run Pipeline")
-        
-        layout.separator()
-        
-        # Results Section
+        # 6. Results Section
         box = layout.box()
         box.label(text="Results", icon='FILE_TICK')
         box.prop(scene, "megasam_output_filter", expand=True)
@@ -64,10 +157,11 @@ class VIEW3D_PT_megasam_panel(bpy.types.Panel):
             col.prop(scene, "megasam_import_motion_threshold")
         col.prop(scene, "megasam_import_animate")
         col.prop(scene, "megasam_import_clean_scene")
+        col.prop(scene, "megasam_import_parent_to_empty")
         
         box.operator("megasam.import_result", icon='IMPORT', text="Import Selected Result")
         
-        # Mesh Generation
+        # 7. Mesh Generation
         sub = box.box()
         sub.label(text="Mesh Generation", icon='MESH_DATA')
         col = sub.column(align=True)
@@ -79,7 +173,13 @@ class VIEW3D_PT_megasam_panel(bpy.types.Panel):
         sub.operator("megasam.generate_mesh", icon='MOD_MESHDEFORM', text="Generate Mesh (Current Frame)")
 
 def register():
-    bpy.utils.register_class(VIEW3D_PT_megasam_panel)
+    try:
+        bpy.utils.register_class(VIEW3D_PT_megasam_panel)
+    except ValueError:
+        pass
 
 def unregister():
-    bpy.utils.unregister_class(VIEW3D_PT_megasam_panel)
+    try:
+        bpy.utils.unregister_class(VIEW3D_PT_megasam_panel)
+    except Exception:
+        pass
