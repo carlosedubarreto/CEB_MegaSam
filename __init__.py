@@ -2,7 +2,7 @@ import os
 import glob
 import re
 import bpy
-from .utils import get_python_path, get_megasam_root
+from .utils import get_python_path, get_megasam_root, get_unique_scene_name
 from . import operators
 from . import panel
 
@@ -28,10 +28,18 @@ bl_info = {
 ## OK - colocar como padrao para mostrar nome do empty
 ## OK - por padrao cvd desativado
 
-## - reduzir consumo de memoria
-## - trocar para os outputs serem na pasta raiz do portable
-## - reorganizar visual
-## - oficial com novo portable python torch 2.10 CUDA 12.8
+### 1.03 WIP1
+## OK - oficial com novo portable python torch 2.10 CUDA 12.8
+## OK - atualizar nome da cena automaticamente ao carregar novo video
+## OK - filtrar lista de resultados para exibir apenas arquivos sgd_cvd_hr
+## OK - renomear automaticamente para evitar sobreescrever processamento anterior
+## OK - reduzir consumo de memoria (presets LOWEST, MEDIUM, HIGH)
+## OK - trocar para os outputs serem na pasta raiz do portable (outputs/<project_name>)
+
+##  - reorganizar visual
+## OK - update scale quando colocar video no VSE
+
+
 
 class MegaSamPreferences(bpy.types.AddonPreferences):
     bl_idname = __package__
@@ -80,27 +88,33 @@ def get_result_items(self, context):
     if not root or not os.path.exists(root):
         return [('NONE', 'Root not set / found', 'Check preferences')]
     
-    # Try multiple common locations
+    portable_root = os.path.dirname(root)
+    
+    # Search locations across portable outputs project folders and legacy roots
     search_paths = [
+        os.path.join(portable_root, "outputs"),
+        os.path.join(portable_root, "outputs", "*"),
+        os.path.join(portable_root, "outputs", "*", "outputs_cvd"),
+        os.path.join(portable_root, "outputs", "*", "outputs"),
         os.path.join(root, "outputs_cvd"),
+        os.path.join(root, "outputs"),
         os.path.join(root, "cvd_opt", "outputs_cvd"),
         os.path.join(root, "mega-sam", "cvd_opt", "outputs_cvd"),
         os.path.join(root, "mega-sam", "outputs_cvd"),
-        os.path.join(root, "outputs"),
         os.path.join(root, "mega-sam", "outputs")
     ]
     
-    output_dirs = []
-    for p in search_paths:
-        if os.path.exists(p) and p not in output_dirs:
-            output_dirs.append(p)
-            
-    if not output_dirs:
-        return [('NONE', 'Outputs folder not found', 'Check project root')]
-        
     files = []
-    for d in output_dirs:
-        files.extend(glob.glob(os.path.join(d, "*.npz")))
+    for sp in search_paths:
+        if "*" in sp:
+            for matched_dir in glob.glob(sp):
+                if os.path.isdir(matched_dir):
+                    files.extend(glob.glob(os.path.join(matched_dir, "*.npz")))
+        elif os.path.isdir(sp):
+            files.extend(glob.glob(os.path.join(sp, "*.npz")))
+            
+    if not files:
+        return [('NONE', 'No results found', 'Check outputs folder')]
         
     items = []
     filter_mode = context.scene.megasam_output_filter
@@ -109,6 +123,9 @@ def get_result_items(self, context):
     
     for f in files:
         basename = os.path.basename(f)
+        # Show only sgd_cvd_hr files and exclude droid files
+        if "_sgd_cvd_hr" not in basename or "_droid" in basename:
+            continue
         if basename in seen_names:
             continue
         seen_names.add(basename)
@@ -133,9 +150,23 @@ def update_video_info(self, context):
         self.megasam_video_frames = 0
         return
 
-    # Auto-populate scene name if empty
-    if not self.megasam_scene_name:
-        self.megasam_scene_name = os.path.splitext(os.path.basename(path))[0]
+    # Automatically update scene name from video name
+    old_scene_name = self.megasam_scene_name
+    base_name = os.path.splitext(os.path.basename(path))[0]
+    repo_root = get_megasam_root(context)
+    if repo_root:
+        portable_root = os.path.dirname(repo_root)
+        output_root = os.path.join(portable_root, "outputs")
+        self.megasam_scene_name = get_unique_scene_name(output_root, base_name)
+    else:
+        self.megasam_scene_name = base_name
+
+    # Also update Blender's scene name if it was default 'Scene' or matched previous video/scene name
+    if self.name.startswith("Scene") or (old_scene_name and self.name == old_scene_name):
+        try:
+            self.name = self.megasam_scene_name
+        except Exception as e:
+            print(f"Could not rename scene: {e}")
 
     try:
         # Load as movieclip to get info
@@ -143,8 +174,7 @@ def update_video_info(self, context):
         self.megasam_video_width = clip.size[0]
         self.megasam_video_height = clip.size[1]
         self.megasam_video_frames = clip.frame_duration
-        if self.megasam_end_frame == 0:
-            self.megasam_end_frame = clip.frame_duration
+        self.megasam_end_frame = clip.frame_duration
         # Remove the clip from memory
         bpy.data.movieclips.remove(clip)
     except Exception as e:
@@ -157,6 +187,47 @@ def update_point_radius(self, context):
             for node in group.nodes:
                 if node.type == 'MESH_TO_POINTS':
                     node.inputs['Radius'].default_value = radius
+
+def update_vram_preset(self, context):
+    preset = self.megasam_vram_preset
+    if preset == 'LOWEST':
+        self.megasam_res_preset = '384'
+        self.megasam_target_width = 384
+        self.megasam_depth_encoder = 'vits'
+        self.megasam_skip_cvd = True
+        self.megasam_buffer = 256
+        self.megasam_stride = 2
+        self.megasam_keyframe_thresh = 3.0
+        self.megasam_frontend_iters = 2
+        self.megasam_backend_iters = 6
+        self.megasam_low_vram = True
+        self.megasam_use_batch = False
+    elif preset == 'MEDIUM':
+        self.megasam_res_preset = '480'
+        self.megasam_target_width = 480
+        self.megasam_depth_encoder = 'vitb'
+        self.megasam_skip_cvd = False
+        self.megasam_cvd_iters = 150
+        self.megasam_buffer = 512
+        self.megasam_stride = 1
+        self.megasam_keyframe_thresh = 2.5
+        self.megasam_frontend_iters = 3
+        self.megasam_backend_iters = 8
+        self.megasam_low_vram = True
+        self.megasam_use_batch = False
+    elif preset == 'HIGH':
+        self.megasam_res_preset = '540'
+        self.megasam_target_width = 540
+        self.megasam_depth_encoder = 'vitl'
+        self.megasam_skip_cvd = False
+        self.megasam_cvd_iters = 400
+        self.megasam_buffer = 1024
+        self.megasam_stride = 1
+        self.megasam_keyframe_thresh = 2.0
+        self.megasam_frontend_iters = 4
+        self.megasam_backend_iters = 12
+        self.megasam_low_vram = True
+        self.megasam_use_batch = False
 
 def update_res_preset(self, context):
     if self.megasam_res_preset != 'CUSTOM':
@@ -197,6 +268,20 @@ def register():
     bpy.types.Scene.megasam_video_height = bpy.props.IntProperty(name="Height", default=0)
     bpy.types.Scene.megasam_video_frames = bpy.props.IntProperty(name="Total Frames", default=0)
     
+    # VRAM Profile Preset
+    bpy.types.Scene.megasam_vram_preset = bpy.props.EnumProperty(
+        name="VRAM Profile",
+        description="Select optimized preset configuration for your GPU memory",
+        items=[
+            ('LOWEST', 'Lowest VRAM (~3-4 GB)', '384p, ViT-Small, Tracking Only (skips heavy CVD loss), Buffer 256, Stride 2'),
+            ('MEDIUM', 'Medium VRAM (~6-8 GB)', '480p, ViT-Base, Balanced CVD (150 iters), Buffer 512, Stride 1'),
+            ('HIGH', 'High VRAM (12GB+)', '540p, ViT-Large, Full CVD (400 iters), Buffer 1024 (Maximum detail)'),
+            ('CUSTOM', 'Custom', 'Manually configure individual parameters')
+        ],
+        default='LOWEST',
+        update=update_vram_preset
+    )
+    
     # Performance & Resolution settings
     bpy.types.Scene.megasam_res_preset = bpy.props.EnumProperty(
         name="Resolution Preset",
@@ -208,13 +293,13 @@ def register():
             ('720', '720p (High Detail)', 'Requires 12GB+ VRAM, slower processing'),
             ('CUSTOM', 'Custom Width', 'Manually specify custom target width')
         ],
-        default='540',
+        default='384',
         update=update_res_preset
     )
     bpy.types.Scene.megasam_target_width = bpy.props.IntProperty(
         name="Target Width",
         description="Width to resize frames to before processing (e.g. 384, 480, 540, 720). Lower = faster & less VRAM",
-        default=540,
+        default=384,
         min=128,
         max=3840
     )
@@ -245,35 +330,35 @@ def register():
     bpy.types.Scene.megasam_stride = bpy.props.IntProperty(
         name="Tracking Frame Stride",
         description="Frame stride for camera tracking. Setting stride 2 or 3 cuts tracking runtime by 50-65% on 30/60fps footage",
-        default=1,
+        default=2,
         min=1,
         max=10
     )
     bpy.types.Scene.megasam_frontend_iters = bpy.props.IntProperty(
         name="Frontend BA Iterations",
         description="Local bundle adjustment optimization iterations per frame (default 4). Lowering to 2 or 3 speeds up tracking",
-        default=4,
+        default=2,
         min=1,
         max=10
     )
     bpy.types.Scene.megasam_backend_iters = bpy.props.IntProperty(
         name="Backend BA Iterations",
         description="Global bundle adjustment optimization iterations (default 12). Lowering to 6 or 8 speeds up final tracking",
-        default=12,
+        default=6,
         min=1,
         max=24
     )
     bpy.types.Scene.megasam_buffer = bpy.props.IntProperty(
         name="Keyframe Buffer",
-        description="Keyframe buffer size for tracking graph updates (default 1024). Lowering to 512 reduces VRAM usage",
-        default=1024,
+        description="Keyframe buffer size for tracking graph updates (default 1024). Lowering to 256/512 reduces VRAM usage",
+        default=256,
         min=128,
         max=2048
     )
     bpy.types.Scene.megasam_keyframe_thresh = bpy.props.FloatProperty(
         name="Keyframe Threshold",
         description="Motion threshold for keyframe creation (default 2.0). Higher values produce fewer keyframes and faster tracking",
-        default=2.0,
+        default=3.0,
         min=0.1,
         max=10.0
     )
@@ -287,7 +372,7 @@ def register():
             ('vitb', 'ViT-Base (Fast)', 'Faster execution with balanced quality'),
             ('vits', 'ViT-Small (Ultra Fast)', 'Runs 4-5x faster with minimal degradation')
         ],
-        default='vitl'
+        default='vits'
     )
 
     # 3. CVD Optimization Controls
@@ -424,6 +509,7 @@ def unregister():
     props = [
         "megasam_point_radius", "megasam_video_path", "megasam_scene_name",
         "megasam_video_width", "megasam_video_height", "megasam_video_frames",
+        "megasam_vram_preset",
         "megasam_res_preset", "megasam_target_width", "megasam_use_frame_range",
         "megasam_start_frame", "megasam_end_frame", "megasam_low_vram",
         "megasam_stride", "megasam_frontend_iters", "megasam_backend_iters",

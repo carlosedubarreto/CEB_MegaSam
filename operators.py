@@ -3,7 +3,7 @@ import os
 import subprocess
 import numpy as np
 import mathutils
-from .utils import get_python_path, get_megasam_root
+from .utils import get_python_path, get_megasam_root, get_unique_scene_name
 
 class MEGASAM_OT_set_range_from_timeline(bpy.types.Operator):
     bl_idname = "megasam.set_range_from_timeline"
@@ -72,10 +72,17 @@ class MEGASAM_OT_run_pipeline(bpy.types.Operator):
             self.report({'ERROR'}, f"Video file path is invalid or file does not exist: {video_path}")
             return {'CANCELLED'}
             
+        portable_root = os.path.dirname(repo_root)
+        output_root = os.path.join(portable_root, "outputs")
+        
         # Use user-provided scene name or fallback to video filename
-        scene_name = scene.megasam_scene_name.strip()
-        if not scene_name:
-            scene_name = os.path.splitext(os.path.basename(video_path))[0]
+        raw_scene_name = scene.megasam_scene_name.strip()
+        if not raw_scene_name:
+            raw_scene_name = os.path.splitext(os.path.basename(video_path))[0]
+            
+        # Enforce unique project/scene name (e.g. chase -> chase_001 -> chase_002)
+        scene_name = get_unique_scene_name(output_root, raw_scene_name)
+        scene.megasam_scene_name = scene_name
         
         # Build command with performance & low-VRAM arguments
         command = [
@@ -83,6 +90,7 @@ class MEGASAM_OT_run_pipeline(bpy.types.Operator):
             script_path,
             "-v", video_path,
             "-s", scene_name,
+            "-o", output_root,
             "-w", str(scene.megasam_target_width),
             "--depth_encoder", scene.megasam_depth_encoder,
             "--stride", str(scene.megasam_stride),
@@ -444,12 +452,26 @@ class MEGASAM_OT_generate_mesh(bpy.types.Operator):
             return {'CANCELLED'}
             
         # 3. Define output path and map timeline frame to NPZ frame index
-        project_dir = os.path.dirname(script_path)
         frame = context.scene.frame_current
         start_frame = scene.megasam_start_frame if scene.megasam_use_frame_range else 0
         stride = scene.megasam_stride if scene.megasam_stride >= 1 else 1
         npz_frame = max(0, round((frame - start_frame) / stride))
-        output_base = os.path.join(project_dir, f"temp_mesh_F{frame:03d}")
+        
+        if scene.megasam_mesh_output_dir:
+            out_dir = bpy.path.abspath(scene.megasam_mesh_output_dir)
+        else:
+            # Default to meshes/ inside project folder
+            npz_dir = os.path.dirname(selected_path)
+            if os.path.basename(npz_dir) in ("outputs_cvd", "outputs"):
+                project_folder = os.path.dirname(npz_dir)
+            else:
+                project_folder = npz_dir
+            out_dir = os.path.join(project_folder, "meshes")
+            
+        os.makedirs(out_dir, exist_ok=True)
+        scene_prefix = scene.megasam_scene_name.strip() or "frame"
+        output_base = os.path.join(out_dir, f"mesh_{scene_prefix}_F{frame:04d}")
+        obj_path = output_base + ".obj"
         
         # Build command
         command = [
@@ -460,7 +482,8 @@ class MEGASAM_OT_generate_mesh(bpy.types.Operator):
             "--upscale", str(scene.megasam_mesh_upscale),
             "--smooth", str(scene.megasam_mesh_smooth),
             "--format", "obj",
-            "--output", output_base
+            "--output", output_base,
+            "--output_dir", out_dir
         ]
         
         # Add filtering arguments if requested
@@ -469,13 +492,6 @@ class MEGASAM_OT_generate_mesh(bpy.types.Operator):
                 "--filter_mode", scene.megasam_import_filter_mode,
                 "--motion_threshold", str(scene.megasam_import_motion_threshold)
             ])
-        
-        if scene.megasam_mesh_output_dir:
-            out_dir = bpy.path.abspath(scene.megasam_mesh_output_dir)
-            command.extend(["--output_dir", out_dir])
-            obj_path = os.path.join(out_dir, os.path.basename(output_base) + ".obj")
-        else:
-            obj_path = output_base + ".obj"
         
         try:
             subprocess.run(command, check=True, creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0)
@@ -490,7 +506,7 @@ class MEGASAM_OT_generate_mesh(bpy.types.Operator):
             else:
                 bpy.ops.import_scene.obj(filepath=obj_path)
                 
-            self.report({'INFO'}, f"Mesh generated for frame {context.scene.frame_current}")
+            self.report({'INFO'}, f"Mesh generated in '{out_dir}' for frame {context.scene.frame_current}")
             return {'FINISHED'}
             
         except subprocess.CalledProcessError:
@@ -498,6 +514,36 @@ class MEGASAM_OT_generate_mesh(bpy.types.Operator):
             return {'CANCELLED'}
         except Exception as e:
             self.report({'ERROR'}, f"Error: {str(e)}")
+            return {'CANCELLED'}
+
+class MEGASAM_OT_open_outputs_folder(bpy.types.Operator):
+    bl_idname = "megasam.open_outputs_folder"
+    bl_label = "Open Outputs Folder"
+    bl_description = "Open the project outputs folder in File Explorer"
+
+    def execute(self, context):
+        repo_root = get_megasam_root(context)
+        if not repo_root or not os.path.exists(repo_root):
+            self.report({'ERROR'}, "MegaSam root folder not found")
+            return {'CANCELLED'}
+            
+        portable_root = os.path.dirname(repo_root)
+        scene_name = context.scene.megasam_scene_name.strip()
+        project_folder = os.path.join(portable_root, "outputs", scene_name) if scene_name else os.path.join(portable_root, "outputs")
+        
+        if not os.path.exists(project_folder):
+            project_folder = os.path.join(portable_root, "outputs")
+            
+        os.makedirs(project_folder, exist_ok=True)
+        try:
+            if os.name == 'nt':
+                os.startfile(project_folder)
+            else:
+                subprocess.Popen(['xdg-open', project_folder])
+            self.report({'INFO'}, f"Opened outputs: {project_folder}")
+            return {'FINISHED'}
+        except Exception as e:
+            self.report({'ERROR'}, f"Could not open folder: {str(e)}")
             return {'CANCELLED'}
 
 def helper_open_vse(context, view_mode='PREVIEW'):
@@ -556,6 +602,8 @@ def helper_open_vse(context, view_mode='PREVIEW'):
                     space.display_mode = 'IMAGE'
                 if hasattr(space, "display_channel"):
                     space.display_channel = 0
+                if hasattr(space, "use_zoom_to_fit"):
+                    space.use_zoom_to_fit = True
                 
                 # Bind active scene to space (Blender 5.x+)
                 for scene_attr in ("scene", "displayed_scene", "target_scene", "editing_scene", "sequencer_scene"):
@@ -575,6 +623,91 @@ def helper_open_vse(context, view_mode='PREVIEW'):
 
     return vse_area
 
+def get_vse_strips_collection(seq_editor):
+    if not seq_editor:
+        return None
+    if hasattr(seq_editor, "strips"):
+        return seq_editor.strips
+    if hasattr(seq_editor, "sequences"):
+        return seq_editor.sequences
+    return None
+
+def helper_fit_vse_view(context, vse_area, strip=None):
+    """
+    Ensures the strip transform scale fits the render frame perfectly without overflow,
+    enables Zoom to Fit on the preview space, and frames the preview and timeline views.
+    """
+    if not vse_area or vse_area.type != 'SEQUENCE_EDITOR':
+        return
+
+    scene = context.scene
+
+    # 1. Enable Zoom to Fit on all VSE preview spaces
+    for space in vse_area.spaces:
+        if space.type == 'SEQUENCE_EDITOR':
+            if hasattr(space, "use_zoom_to_fit"):
+                space.use_zoom_to_fit = True
+
+    # 2. Locate the MOVIE strip (ignoring SoundStrip if present)
+    seq_editor = scene.sequence_editor
+    seqs_coll = get_vse_strips_collection(seq_editor)
+    movie_strip = strip if (strip and getattr(strip, "type", "") == 'MOVIE') else None
+
+    if not movie_strip and seqs_coll:
+        for s in reversed(list(seqs_coll)):
+            if getattr(s, "type", "") == 'MOVIE':
+                movie_strip = s
+                break
+
+    # 3. Ensure the movie strip transform fits the render resolution 1:1
+    if movie_strip and hasattr(movie_strip, "transform"):
+        orig_w = 0
+        orig_h = 0
+        if hasattr(movie_strip, "elements") and len(movie_strip.elements) > 0:
+            orig_w = movie_strip.elements[0].orig_width
+            orig_h = movie_strip.elements[0].orig_height
+
+        if orig_w > 0 and orig_h > 0:
+            if scene.render.resolution_x == orig_w and scene.render.resolution_y == orig_h:
+                movie_strip.transform.scale_x = 1.0
+                movie_strip.transform.scale_y = 1.0
+            else:
+                fit_scale = min(scene.render.resolution_x / orig_w, scene.render.resolution_y / orig_h)
+                movie_strip.transform.scale_x = fit_scale
+                movie_strip.transform.scale_y = fit_scale
+        else:
+            movie_strip.transform.scale_x = 1.0
+            movie_strip.transform.scale_y = 1.0
+
+        movie_strip.transform.offset_x = 0.0
+        movie_strip.transform.offset_y = 0.0
+        if hasattr(movie_strip.transform, "rotation"):
+            movie_strip.transform.rotation = 0.0
+
+        # Make movie_strip active and selected
+        if seq_editor and hasattr(seq_editor, "active_strip"):
+            seq_editor.active_strip = movie_strip
+        if hasattr(movie_strip, "select"):
+            movie_strip.select = True
+
+    # 4. Zoom preview to fit inside view window (view_all_preview)
+    # and zoom timeline to fit sequence (view_all)
+    for r in vse_area.regions:
+        if r.type in ('PREVIEW', 'WINDOW'):
+            try:
+                with context.temp_override(area=vse_area, region=r):
+                    bpy.ops.sequencer.view_all_preview()
+            except Exception:
+                pass
+        if r.type == 'WINDOW':
+            try:
+                with context.temp_override(area=vse_area, region=r):
+                    bpy.ops.sequencer.view_all()
+            except Exception:
+                pass
+
+    vse_area.tag_redraw()
+
 class MEGASAM_OT_open_vse(bpy.types.Operator):
     bl_idname = "megasam.open_vse"
     bl_label = "Open VSE"
@@ -585,21 +718,34 @@ class MEGASAM_OT_open_vse(bpy.types.Operator):
         view_mode = scene.megasam_vse_view_mode
         area = helper_open_vse(context, view_mode=view_mode)
         if area:
+            # Fit view to existing strip if any
+            seq_editor = scene.sequence_editor
+            seqs = get_vse_strips_collection(seq_editor)
+            movie_strip = None
+            if seqs:
+                for s in reversed(list(seqs)):
+                    if getattr(s, "type", "") == 'MOVIE':
+                        movie_strip = s
+                        break
+            helper_fit_vse_view(context, area, strip=movie_strip)
+
+            def deferred_open_fit():
+                try:
+                    if hasattr(context, "screen") and area in context.screen.areas and area.type == 'SEQUENCE_EDITOR':
+                        helper_fit_vse_view(context, area, strip=movie_strip)
+                except Exception:
+                    pass
+                return None
+
+            if hasattr(bpy.app, "timers"):
+                bpy.app.timers.register(deferred_open_fit, first_interval=0.05)
+
             mode_names = {'PREVIEW': 'Preview', 'SEQUENCER': 'Sequencer', 'SEQUENCER_PREVIEW': 'Sequencer & Preview'}
             self.report({'INFO'}, f"VSE opened in {mode_names.get(view_mode, view_mode)} mode")
             return {'FINISHED'}
         else:
             self.report({'ERROR'}, "Could not open Video Sequence Editor")
             return {'CANCELLED'}
-
-def get_vse_strips_collection(seq_editor):
-    if not seq_editor:
-        return None
-    if hasattr(seq_editor, "strips"):
-        return seq_editor.strips
-    if hasattr(seq_editor, "sequences"):
-        return seq_editor.sequences
-    return None
 
 class MEGASAM_OT_load_video_vse(bpy.types.Operator):
     bl_idname = "megasam.load_video_vse"
@@ -622,6 +768,28 @@ class MEGASAM_OT_load_video_vse(bpy.types.Operator):
                 except Exception as e:
                     print("Error setting workspace.sequencer_scene:", e)
 
+            # Ensure scene name is set
+            if not scene.megasam_scene_name.strip():
+                base_name = os.path.splitext(os.path.basename(path))[0]
+                repo_root = get_megasam_root(context)
+                if repo_root:
+                    portable_root = os.path.dirname(repo_root)
+                    output_root = os.path.join(portable_root, "outputs")
+                    scene.megasam_scene_name = get_unique_scene_name(output_root, base_name)
+                else:
+                    scene.megasam_scene_name = base_name
+
+            if scene.name.startswith("Scene"):
+                try:
+                    scene.name = scene.megasam_scene_name
+                except Exception:
+                    pass
+
+            # Pre-set render resolution if known to prevent movie_strip_add from scaling up
+            if scene.megasam_video_width > 0 and scene.megasam_video_height > 0:
+                scene.render.resolution_x = scene.megasam_video_width
+                scene.render.resolution_y = scene.megasam_video_height
+
             # 1. Ensure VSE area exists and is configured
             vse_area = helper_open_vse(context, view_mode=scene.megasam_vse_view_mode)
 
@@ -641,43 +809,77 @@ class MEGASAM_OT_load_video_vse(bpy.types.Operator):
             strip_name = os.path.basename(path)
             start_frame = scene.megasam_start_frame if scene.megasam_use_frame_range and scene.megasam_start_frame > 0 else 1
             
-            added_strip = None
+            added_movie_strip = None
             if vse_area:
                 try:
                     with context.temp_override(area=vse_area):
                         bpy.ops.sequencer.movie_strip_add(filepath=path, frame_start=start_frame, channel=1)
                     seqs_coll = get_vse_strips_collection(seq_editor)
-                    if seqs_coll and len(seqs_coll) > 0:
-                        added_strip = seqs_coll[-1]
+                    if seqs_coll:
+                        for s in reversed(list(seqs_coll)):
+                            if getattr(s, "type", "") == 'MOVIE':
+                                added_movie_strip = s
+                                break
                 except Exception as e:
                     print("movie_strip_add operator failed, using fallback:", e)
 
-            if not added_strip:
+            if not added_movie_strip:
                 seqs_coll = get_vse_strips_collection(seq_editor)
                 if seqs_coll is None:
                     self.report({'ERROR'}, "Could not access sequence editor strips container")
                     return {'CANCELLED'}
-                added_strip = seqs_coll.new_movie(
+                added_movie_strip = seqs_coll.new_movie(
                     name=strip_name,
                     filepath=path,
                     channel=1,
                     frame_start=start_frame
                 )
 
-            # 5. Sync timeline range & current playhead frame
+            # 5. Update render resolution to match exact video element dimensions
+            if added_movie_strip and hasattr(added_movie_strip, "elements") and len(added_movie_strip.elements) > 0:
+                elem_w = added_movie_strip.elements[0].orig_width
+                elem_h = added_movie_strip.elements[0].orig_height
+                if elem_w > 0 and elem_h > 0:
+                    scene.render.resolution_x = elem_w
+                    scene.render.resolution_y = elem_h
+                    scene.megasam_video_width = elem_w
+                    scene.megasam_video_height = elem_h
+            elif scene.megasam_video_width > 0 and scene.megasam_video_height > 0:
+                scene.render.resolution_x = scene.megasam_video_width
+                scene.render.resolution_y = scene.megasam_video_height
+
+            # 6. Ensure movie strip scale is 1.0 (matching resolution)
+            if added_movie_strip and hasattr(added_movie_strip, "transform"):
+                added_movie_strip.transform.scale_x = 1.0
+                added_movie_strip.transform.scale_y = 1.0
+                added_movie_strip.transform.offset_x = 0.0
+                added_movie_strip.transform.offset_y = 0.0
+
+            # 7. Sync timeline range & current playhead frame
             scene.frame_start = start_frame
-            if added_strip and hasattr(added_strip, "frame_final_duration") and added_strip.frame_final_duration > 0:
-                scene.frame_end = start_frame + int(added_strip.frame_final_duration) - 1
+            if added_movie_strip and hasattr(added_movie_strip, "frame_final_duration") and added_movie_strip.frame_final_duration > 0:
+                scene.frame_end = start_frame + int(added_movie_strip.frame_final_duration) - 1
             elif scene.megasam_video_frames > 0:
                 scene.frame_end = start_frame + scene.megasam_video_frames - 1
                 
             # Set playhead frame to start_frame to immediately display video preview
             scene.frame_current = start_frame
 
-            # Update render resolution to match video dimensions
-            if scene.megasam_video_width > 0 and scene.megasam_video_height > 0:
-                scene.render.resolution_x = scene.megasam_video_width
-                scene.render.resolution_y = scene.megasam_video_height
+            # 8. Fit strip transform and zoom VSE view to make video fully inside the view
+            if vse_area:
+                helper_fit_vse_view(context, vse_area, strip=added_movie_strip)
+
+                # Also schedule a deferred fit in GUI mode once Blender has computed area/region layout
+                def deferred_fit():
+                    try:
+                        if hasattr(context, "screen") and vse_area in context.screen.areas and vse_area.type == 'SEQUENCE_EDITOR':
+                            helper_fit_vse_view(context, vse_area, strip=added_movie_strip)
+                    except Exception:
+                        pass
+                    return None
+
+                if hasattr(bpy.app, "timers"):
+                    bpy.app.timers.register(deferred_fit, first_interval=0.05)
 
             # Refresh VSE area
             if vse_area:
@@ -696,6 +898,7 @@ classes = (
     MEGASAM_OT_run_pipeline,
     MEGASAM_OT_import_result,
     MEGASAM_OT_generate_mesh,
+    MEGASAM_OT_open_outputs_folder,
     MEGASAM_OT_open_vse,
     MEGASAM_OT_load_video_vse,
 )

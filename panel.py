@@ -67,6 +67,15 @@ class VIEW3D_PT_megasam_panel(bpy.types.Panel):
         sub.label(text="Performance & Speed Optimization", icon='MODIFIER')
         
         col = sub.column(align=True)
+        col.prop(scene, "megasam_vram_preset", text="VRAM Profile")
+        if scene.megasam_vram_preset == 'LOWEST':
+            col.label(text="Profile: ~3-4GB (384p, ViT-S, Tracking Only)", icon='INFO')
+        elif scene.megasam_vram_preset == 'MEDIUM':
+            col.label(text="Profile: ~6-8GB (480p, ViT-B, Balanced CVD)", icon='INFO')
+        elif scene.megasam_vram_preset == 'HIGH':
+            col.label(text="Profile: 12GB+ (540p, ViT-L, Full CVD)", icon='INFO')
+        
+        col.separator()
         col.prop(scene, "megasam_res_preset", text="Resolution")
         if scene.megasam_res_preset == 'CUSTOM':
             col.prop(scene, "megasam_target_width", text="Width (px)")
@@ -159,7 +168,9 @@ class VIEW3D_PT_megasam_panel(bpy.types.Panel):
         col.prop(scene, "megasam_import_clean_scene")
         col.prop(scene, "megasam_import_parent_to_empty")
         
-        box.operator("megasam.import_result", icon='IMPORT', text="Import Selected Result")
+        row = box.row(align=True)
+        row.operator("megasam.import_result", icon='IMPORT', text="Import Selected Result")
+        row.operator("megasam.open_outputs_folder", icon='FILE_FOLDER', text="Open Project Folder")
         
         # 7. Mesh Generation
         sub = box.box()

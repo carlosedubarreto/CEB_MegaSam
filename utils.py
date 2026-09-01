@@ -21,6 +21,9 @@ def get_python_path(context=None):
     # Auto-detection search paths
     addon_dir = os.path.dirname(os.path.abspath(__file__))
     candidates = [
+        os.path.join(addon_dir, "..", "Portable_torch210_cu128", "python-3.10.11-embed-amd64", "python.exe"),
+        os.path.join(addon_dir, "..", "..", "Portable_torch210_cu128", "python-3.10.11-embed-amd64", "python.exe"),
+        r"D:\_Code\Meu\CEB_MegaSam_prj\Portable_torch210_cu128\python-3.10.11-embed-amd64\python.exe",
         os.path.join(addon_dir, "..", "Portable", "python-3.10.11-embed-amd64", "python.exe"),
         os.path.join(addon_dir, "..", "..", "Portable", "python-3.10.11-embed-amd64", "python.exe"),
         r"D:\_Code\Meu\CEB_MegaSam_prj\Portable\python-3.10.11-embed-amd64\python.exe",
@@ -62,6 +65,9 @@ def get_megasam_root(context=None):
         ])
 
     candidates.extend([
+        os.path.join(addon_dir, "..", "Portable_torch210_cu128", "mega-sam"),
+        os.path.join(addon_dir, "..", "..", "Portable_torch210_cu128", "mega-sam"),
+        r"D:\_Code\Meu\CEB_MegaSam_prj\Portable_torch210_cu128\mega-sam",
         os.path.join(addon_dir, "..", "Portable", "mega-sam"),
         os.path.join(addon_dir, "..", "mega-sam"),
         os.path.join(addon_dir, "..", "..", "Portable", "mega-sam"),
@@ -79,3 +85,40 @@ def get_megasam_root(context=None):
                 return norm
 
     return root_path
+
+def get_unique_scene_name(base_output_dir, base_name):
+    """
+    If base_output_dir / base_name exists or if base_output_dir / f'{base_name}_sgd_cvd_hr.npz' exists,
+    increment with _001, _002, etc. until an unused name is found.
+    Handles existing trailing numbers like 'chase_001' -> 'chase_002'.
+    """
+    import re
+    if not base_output_dir or not base_name:
+        return base_name or "scene"
+        
+    def is_taken(name):
+        folder_path = os.path.join(base_output_dir, name)
+        npz_cvd = os.path.join(base_output_dir, f"{name}_sgd_cvd_hr.npz")
+        npz_droid = os.path.join(base_output_dir, f"{name}_droid.npz")
+        inner_cvd = os.path.join(base_output_dir, name, "outputs_cvd", f"{name}_sgd_cvd_hr.npz")
+        return os.path.exists(folder_path) or os.path.exists(npz_cvd) or os.path.exists(npz_droid) or os.path.exists(inner_cvd)
+
+    if not is_taken(base_name):
+        return base_name
+
+    match = re.search(r'^(.*)_(\d+)$', base_name)
+    if match:
+        prefix = match.group(1)
+        start_idx = int(match.group(2)) + 1
+        pad_len = max(3, len(match.group(2)))
+    else:
+        prefix = base_name
+        start_idx = 1
+        pad_len = 3
+
+    idx = start_idx
+    while True:
+        candidate = f"{prefix}_{idx:0{pad_len}d}"
+        if not is_taken(candidate):
+            return candidate
+        idx += 1
