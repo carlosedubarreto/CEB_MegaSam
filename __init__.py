@@ -9,7 +9,7 @@ from . import panel
 bl_info = {
     "name": "CEB MegaSam",
     "author": "Carlos Barreto, Antigravity",
-    "version": (1, 2),
+    "version": (1, 3),
     "blender": (4, 4, 3),
     "location": "View3D > N-Panel > CEB",
     "description": "Run MegaSam pipeline from Blender with auto-detection, low-VRAM, and speed controls",
@@ -36,7 +36,7 @@ bl_info = {
 ## OK - reduzir consumo de memoria (presets LOWEST, MEDIUM, HIGH)
 ## OK - trocar para os outputs serem na pasta raiz do portable (outputs/<project_name>)
 
-##  - reorganizar visual
+## OK - reorganizar visual
 ## OK - update scale quando colocar video no VSE
 
 
