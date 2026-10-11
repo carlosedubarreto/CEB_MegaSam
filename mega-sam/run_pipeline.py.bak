@@ -1,0 +1,372 @@
+import os
+import subprocess
+import argparse
+from pathlib import Path
+import sys
+import shutil
+import time
+import re
+import cv2
+
+def format_time(seconds):
+    """Format seconds into a human-readable string (e.g. 1h 05m 23.4s, 3m 12.5s, or 14.20s)."""
+    hrs = int(seconds // 3600)
+    mins = int((seconds % 3600) // 60)
+    secs = seconds % 60
+    if hrs > 0:
+        return f"{hrs}h {mins:02d}m {secs:04.1f}s"
+    elif mins > 0:
+        return f"{mins}m {secs:04.1f}s"
+    else:
+        return f"{secs:.2f}s"
+
+def run_command(command, cwd=None):
+    """Executes a command and handles errors."""
+    print(f"\n>>> Executing: {' '.join(command)}")
+    try:
+        result = subprocess.run(command, check=True, cwd=cwd)
+        return result
+    except subprocess.CalledProcessError as e:
+        print(f"\n[ERROR] Command failed with exit code {e.returncode}")
+        sys.exit(e.returncode)
+
+def get_unique_scene_name(base_output_dir, base_name):
+    """
+    If base_output_dir / base_name exists or if base_output_dir / f'{base_name}_sgd_cvd_hr.npz' exists,
+    increment with _001, _002, etc. until an unused name is found.
+    Handles existing trailing numbers like 'chase_001' -> 'chase_002'.
+    """
+    base_output_dir = Path(base_output_dir)
+    
+    def is_taken(name):
+        return (
+            (base_output_dir / name).exists() or
+            (base_output_dir / f"{name}_sgd_cvd_hr.npz").exists() or
+            (base_output_dir / f"{name}_droid.npz").exists() or
+            (base_output_dir / name / "outputs_cvd" / f"{name}_sgd_cvd_hr.npz").exists()
+        )
+        
+    if not is_taken(base_name):
+        return base_name
+        
+    match = re.search(r'^(.*)_(\d+)$', base_name)
+    if match:
+        prefix = match.group(1)
+        start_idx = int(match.group(2)) + 1
+        pad_len = max(3, len(match.group(2)))
+    else:
+        prefix = base_name
+        start_idx = 1
+        pad_len = 3
+        
+    idx = start_idx
+    while True:
+        candidate = f"{prefix}_{idx:0{pad_len}d}"
+        if not is_taken(candidate):
+            return candidate
+        idx += 1
+
+def run_single_batch(args, repo_root, project_dir, batch_scene_name, start_f, end_f):
+    """Runs the MegaSam pipeline for a single batch/scene, saving all files inside project_dir."""
+    batch_start_time = time.time()
+    
+    # Define organized subdirectories inside the project folder
+    frames_dir = project_dir / "frames"
+    depth_anything_dir = project_dir / "depth_anything"
+    unidepth_dir = project_dir / "unidepth"
+    reconstructions_dir = project_dir / "reconstructions"
+    cache_flow_dir = project_dir / "cache_flow"
+    outputs_cvd_dir = project_dir / "outputs_cvd"
+    outputs_droid_dir = project_dir / "outputs"
+    
+    for d in [frames_dir, depth_anything_dir, unidepth_dir, reconstructions_dir, cache_flow_dir, outputs_cvd_dir, outputs_droid_dir]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    img_path = str(frames_dir / batch_scene_name)
+    
+    print("\n" + "="*60)
+    print(f"PROCESSING SCENE/BATCH: {batch_scene_name}")
+    print(f"Project Folder: {project_dir}")
+    print(f"Frames: {start_f} to {end_f}")
+    print(f"Depth-Anything Encoder: {args.depth_encoder}")
+    print(f"Tracking: stride={args.stride}, buffer={args.buffer}, frontend_iters={args.frontend_iters}, backend_iters={args.backend_iters}")
+    if args.skip_cvd:
+        print("Mode: CAMERA TRACKING ONLY (Skipping RAFT & CVD Optimization)")
+    else:
+        print(f"CVD Optimization iterations: {args.cvd_iters}")
+    print("="*60)
+
+    # 0. Cleanup existing batch subfolders if present
+    cleanup_paths = [
+        frames_dir / batch_scene_name,
+        depth_anything_dir / batch_scene_name,
+        unidepth_dir / batch_scene_name,
+        reconstructions_dir / batch_scene_name,
+        cache_flow_dir / batch_scene_name
+    ]
+    for p in cleanup_paths:
+        if p.exists():
+            print(f"Cleaning existing directory: {p}")
+            if p.is_dir():
+                shutil.rmtree(p)
+            else:
+                os.remove(p)
+
+    # 1. Extract Frames
+    t_stage = time.time()
+    run_command([
+        sys.executable, str(repo_root / "convert_video_to_img_seq.py"),
+        "-v", args.video_path,
+        "-o", str(frames_dir),
+        "-s", batch_scene_name,
+        "-w", str(args.target_width),
+        "--start_frame", str(start_f),
+        "--end_frame", str(end_f)
+    ], cwd=str(repo_root))
+    print(f"[TIMER] Frame Extraction took {format_time(time.time() - t_stage)}")
+
+    # 2. Run Depth Anything
+    depth_weights = repo_root / "Depth-Anything" / "checkpoints" / f"depth_anything_{args.depth_encoder}14.pth"
+    if not depth_weights.exists():
+        print(f"\n[ERROR] Depth-Anything checkpoint not found for encoder '{args.depth_encoder}': {depth_weights}")
+        print(f"        Please download the matching checkpoint and place it at the path above.")
+        print(f"        Available encoders with checkpoints:")
+        for enc in ['vitl', 'vitb', 'vits']:
+            p = repo_root / "Depth-Anything" / "checkpoints" / f"depth_anything_{enc}14.pth"
+            status = "FOUND" if p.exists() else "MISSING"
+            print(f"          [{status}] {enc}: {p}")
+        sys.exit(1)
+    depth_weights = str(depth_weights)
+
+    t_stage = time.time()
+    depth_out_batch = str(depth_anything_dir / batch_scene_name)
+    run_command([
+        sys.executable, str(repo_root / "Depth-Anything" / "run_videos.py"),
+        "--encoder", args.depth_encoder,
+        "--load-from", depth_weights,
+        "--img-path", img_path,
+        "--outdir", depth_out_batch
+    ], cwd=str(repo_root))
+    print(f"[TIMER] Depth-Anything ({args.depth_encoder}) took {format_time(time.time() - t_stage)}")
+
+    # 3. Run UniDepth
+    t_stage = time.time()
+    run_command([
+        sys.executable, str(repo_root / "UniDepth" / "scripts" / "demo_mega-sam.py"),
+        "--scene-name", batch_scene_name,
+        "--img-path", img_path,
+        "--outdir", str(unidepth_dir)
+    ], cwd=str(repo_root))
+    print(f"[TIMER] UniDepth took {format_time(time.time() - t_stage)}")
+
+    # 4. Run Camera Tracking (MegaSam test_demo)
+    t_stage = time.time()
+    megasam_weights = str(repo_root / args.megasam_weights) if not os.path.isabs(args.megasam_weights) else args.megasam_weights
+    
+    tracking_cmd = [
+        sys.executable, str(repo_root / "camera_tracking_scripts" / "test_demo.py"),
+        "--datapath", img_path,
+        "--weights", megasam_weights,
+        "--scene_name", batch_scene_name,
+        "--mono_depth_path", str(depth_anything_dir),
+        "--metric_depth_path", str(unidepth_dir),
+        "--reconstructions_dir", str(reconstructions_dir),
+        "--output_dir", str(outputs_droid_dir),
+        "--buffer", str(args.buffer),
+        "--keyframe_thresh", str(args.keyframe_thresh),
+        "--stride", str(args.stride),
+        "--frontend_iters", str(args.frontend_iters),
+        "--backend_iters", str(args.backend_iters),
+        "--disable_vis"
+    ]
+    run_command(tracking_cmd, cwd=str(repo_root))
+    print(f"[TIMER] Camera Tracking took {format_time(time.time() - t_stage)}")
+
+    droid_npz = outputs_droid_dir / f"{batch_scene_name}_droid.npz"
+    final_cvd_npz = outputs_cvd_dir / f"{batch_scene_name}_sgd_cvd_hr.npz"
+
+    if args.skip_cvd:
+        print("\n[INFO] Skipping CVD Optimization (Camera Tracking only mode).")
+        if droid_npz.exists():
+            shutil.copyfile(str(droid_npz), str(final_cvd_npz))
+            print(f"Copied {droid_npz.name} -> {final_cvd_npz.name}")
+        batch_elapsed = time.time() - batch_start_time
+        print(f"\n[TIMER] Batch '{batch_scene_name}' completed in {format_time(batch_elapsed)}")
+        return
+
+    # 5. Preprocess Flow (RAFT)
+    t_stage = time.time()
+    raft_weights = str(repo_root / args.raft_weights) if not os.path.isabs(args.raft_weights) else args.raft_weights
+    run_command([
+        sys.executable, str(repo_root / "cvd_opt" / "preprocess_flow.py"),
+        "--datapath", img_path,
+        "--model", raft_weights,
+        "--scene_name", batch_scene_name,
+        "--cache_dir", str(cache_flow_dir),
+        "--mixed_precision"
+    ], cwd=str(repo_root))
+    print(f"[TIMER] RAFT Optical Flow took {format_time(time.time() - t_stage)}")
+
+    # 6. Run CVD Optimization
+    t_stage = time.time()
+    run_command([
+        sys.executable, str(repo_root / "cvd_opt" / "cvd_opt.py"),
+        "--scene_name", batch_scene_name,
+        "--reconstructions_dir", str(reconstructions_dir),
+        "--cache_dir", str(cache_flow_dir),
+        "--output_dir", str(outputs_cvd_dir),
+        "--stride", str(args.stride),
+        "--w_grad", "2.0",
+        "--w_normal", "5.0",
+        "--opt_iters", str(args.cvd_iters)
+    ], cwd=str(repo_root))
+    print(f"[TIMER] CVD Optimization ({args.cvd_iters} iters) took {format_time(time.time() - t_stage)}")
+
+    batch_elapsed = time.time() - batch_start_time
+    print(f"\n[TIMER] Batch '{batch_scene_name}' total time: {format_time(batch_elapsed)}")
+
+def main():
+    parser = argparse.ArgumentParser(description="MegaSam Pipeline Master Script")
+    
+    # Core Arguments
+    parser.add_argument("--video_path", "-v", type=str, required=True, help="Path to input video")
+    parser.add_argument("--output_root", "-o", type=str, default=None, help="Root directory for outputs (defaults to portable root / outputs)")
+    parser.add_argument("--scene_name", "-s", type=str, required=True, help="Name of the scene/project")
+    parser.add_argument("--target_width", "-w", type=int, default=384, help="Target width for resizing")
+    parser.add_argument("--start_frame", type=int, default=0, help="Start frame index")
+    parser.add_argument("--end_frame", type=int, default=None, help="End frame index (optional, defaults to video length)")
+    parser.add_argument("--batch_size", type=int, default=0, help="Number of frames per batch. If > 0, the video will be split into multiple scenes.")
+    
+    # Model Paths & Backbones
+    parser.add_argument("--depth_encoder", type=str, default="vits", choices=["vitl", "vitb", "vits"], help="Depth-Anything encoder backbone")
+    parser.add_argument("--depth_anything_weights", type=str, default="Depth-Anything/checkpoints/depth_anything_vitl14.pth")
+    parser.add_argument("--megasam_weights", type=str, default="checkpoints/megasam_final.pth")
+    parser.add_argument("--raft_weights", type=str, default="cvd_opt/raft-things.pth")
+    
+    # Tracking Optimization Flags
+    parser.add_argument("--stride", type=int, default=2, help="Frame stride for camera tracking (e.g. 2 or 3 for 50-65%% faster tracking)")
+    parser.add_argument("--buffer", type=int, default=256, help="Keyframe buffer size (256/512 for low VRAM)")
+    parser.add_argument("--keyframe_thresh", type=float, default=3.0, help="Motion threshold for keyframe creation")
+    parser.add_argument("--frontend_iters", type=int, default=2, help="Frontend BA iterations (lower to 2 or 3 for speed)")
+    parser.add_argument("--backend_iters", type=int, default=6, help="Backend BA iterations (lower to 6 or 8 for speed)")
+    
+    # CVD Flags
+    parser.add_argument("--cvd_iters", type=int, default=400, help="CVD optimization iterations (lower to 100 or 200 for speed)")
+    parser.add_argument("--skip_cvd", action="store_true", help="Skip CVD depth optimization (Camera Tracking only mode)")
+    
+    args = parser.parse_args()
+    repo_root = Path(__file__).parent.absolute()
+    
+    # Portable Root is the parent folder of mega-sam
+    portable_root = repo_root.parent
+    
+    # Determine base outputs folder: either provided or portable_root / "outputs"
+    if args.output_root:
+        base_output_dir = Path(args.output_root)
+    else:
+        base_output_dir = portable_root / "outputs"
+        
+    base_output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Auto-number project name if folder or output files already exist
+    original_scene_name = args.scene_name
+    unique_scene_name = get_unique_scene_name(base_output_dir, original_scene_name)
+    if unique_scene_name != original_scene_name:
+        print("="*70)
+        print(f"[INFO] Project '{original_scene_name}' already exists in outputs.")
+        print(f"[INFO] Automatically using unique name: '{unique_scene_name}'")
+        print("="*70)
+    args.scene_name = unique_scene_name
+    
+    project_dir = base_output_dir / args.scene_name
+    project_dir.mkdir(parents=True, exist_ok=True)
+
+    print("="*70)
+    print(f"MEGASAM PIPELINE - PROJECT INITIALIZATION")
+    print(f"Project Name   : {args.scene_name}")
+    print(f"Project Folder : {project_dir}")
+    print(f"Portable Root  : {portable_root}")
+    print(f"MegaSam Root   : {repo_root}")
+    print("="*70)
+
+    pipeline_start_time = time.time()
+
+    try:
+        cap = cv2.VideoCapture(args.video_path)
+        if not cap.isOpened():
+            print(f"[ERROR] Could not open video: {args.video_path}")
+            sys.exit(1)
+            
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        cap.release()
+        
+        if args.batch_size > 0:
+            start_global = args.start_frame
+            end_global = args.end_frame if args.end_frame is not None else total_frames
+            
+            print(f"BATCH MODE ENABLED: Splitting {end_global - start_global} frames into batches of {args.batch_size}")
+            
+            batch_all_start = time.time()
+            batch_idx = 0
+            for current_start in range(start_global, end_global, args.batch_size):
+                current_end = min(current_start + args.batch_size, end_global)
+                batch_scene_name = f"{args.scene_name}_b{batch_idx:03d}"
+                run_single_batch(args, repo_root, project_dir, batch_scene_name, current_start, current_end)
+                batch_idx += 1
+                
+            batch_all_elapsed = time.time() - batch_all_start
+            print("\n" + "="*60)
+            print(f"ALL {batch_idx} BATCHES COMPLETED SUCCESSFULLY!")
+            print(f"Total Batch Processing Runtime: {format_time(batch_all_elapsed)}")
+            print("="*60)
+
+            # Stitch batches into unified sequence (runs for both CVD and Tracking-only modes)
+            outputs_cvd_dir = project_dir / "outputs_cvd"
+            stitched_final_npz = outputs_cvd_dir / f"{args.scene_name}_sgd_cvd_hr.npz"
+            t_stitch = time.time()
+            print("\n" + "="*60)
+            print("STARTING BATCH STITCHING & TRAJECTORY ALIGNMENT...")
+            print("="*60)
+            run_command([
+                sys.executable, str(repo_root / "stitch_npz_batches.py"),
+                "--input_dir", str(outputs_cvd_dir),
+                "--scene_name", args.scene_name,
+                "--output", str(stitched_final_npz)
+            ], cwd=str(repo_root))
+            print(f"[TIMER] Batch Stitching took {format_time(time.time() - t_stitch)}")
+            
+            # Copy final result to root of project folder and outputs dir for easy access
+            if stitched_final_npz.exists():
+                shutil.copyfile(str(stitched_final_npz), str(project_dir / f"{args.scene_name}_sgd_cvd_hr.npz"))
+                shutil.copyfile(str(stitched_final_npz), str(base_output_dir / f"{args.scene_name}_sgd_cvd_hr.npz"))
+            
+            pipeline_total_elapsed = time.time() - pipeline_start_time
+            print("\n" + "="*60)
+            print("PIPELINE COMPLETED SUCCESSFULLY!")
+            print(f"All project results saved to: {project_dir}")
+            print(f"Total Pipeline Runtime: {format_time(pipeline_total_elapsed)}")
+            print("="*60)
+            
+        else:
+            end_f = args.end_frame if args.end_frame is not None else total_frames
+            run_single_batch(args, repo_root, project_dir, args.scene_name, args.start_frame, end_f)
+            
+            # Copy final result to root of project folder and base outputs dir
+            final_npz = project_dir / "outputs_cvd" / f"{args.scene_name}_sgd_cvd_hr.npz"
+            if final_npz.exists():
+                shutil.copyfile(str(final_npz), str(project_dir / f"{args.scene_name}_sgd_cvd_hr.npz"))
+                shutil.copyfile(str(final_npz), str(base_output_dir / f"{args.scene_name}_sgd_cvd_hr.npz"))
+                
+            pipeline_total_elapsed = time.time() - pipeline_start_time
+            print("\n" + "="*60)
+            print("PIPELINE COMPLETED SUCCESSFULLY!")
+            print(f"All project results saved to: {project_dir}")
+            print(f"Total Pipeline Runtime: {format_time(pipeline_total_elapsed)}")
+            print("="*60)
+    finally:
+        print("\n" + "-"*30)
+        input("Execution finished. Press Enter to close this window...")
+        print("-"*30)
+
+if __name__ == "__main__":
+    main()

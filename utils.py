@@ -37,7 +37,7 @@ def get_python_path(context=None):
     return py_path
 
 def get_megasam_root(context=None):
-    """Resolve the MegaSam project root folder, auto-detecting from the Python portable parent folder."""
+    """Resolve the MegaSam project root folder, prioritizing the addon folder then portable fallbacks."""
     root_path = ""
     addon_name = __package__.split('.')[0] if __package__ else "CEB_MegaSam"
     if context and hasattr(context, "preferences") and addon_name in context.preferences.addons:
@@ -49,11 +49,15 @@ def get_megasam_root(context=None):
         if os.path.isdir(root_path):
             return root_path
 
+    addon_dir = os.path.dirname(os.path.abspath(__file__))
+    # Prioritize mega-sam inside the addon folder
+    candidates = [
+        os.path.join(addon_dir, "mega-sam"),
+        addon_dir,
+    ]
+
     # Auto-detection relative to python portable path
     py_path = get_python_path(context)
-    addon_dir = os.path.dirname(os.path.abspath(__file__))
-    candidates = []
-
     if py_path:
         py_dir = py_path if os.path.isdir(py_path) else os.path.dirname(py_path)
         py_parent = os.path.dirname(py_dir)
@@ -77,14 +81,79 @@ def get_megasam_root(context=None):
     for c in candidates:
         norm = os.path.normpath(c)
         if os.path.isdir(norm):
-            # Check for characteristic MegaSam files / subfolders
-            if (os.path.exists(os.path.join(norm, "run_pipeline.py")) or 
-                os.path.exists(os.path.join(norm, "cvd_opt")) or 
-                os.path.exists(os.path.join(norm, "Depth-Anything")) or
-                os.path.exists(os.path.join(norm, "mega-sam", "run_pipeline.py"))):
+            # If inside norm there is a mega-sam subfolder containing run_pipeline.py
+            if os.path.exists(os.path.join(norm, "run_pipeline.py")):
+                return norm
+            if os.path.exists(os.path.join(norm, "mega-sam", "run_pipeline.py")):
+                return os.path.join(norm, "mega-sam")
+            if os.path.exists(os.path.join(norm, "cvd_opt")) or os.path.exists(os.path.join(norm, "Depth-Anything")):
                 return norm
 
     return root_path
+
+def get_portable_root(context=None):
+    """Resolve the portable Python root directory (e.g. Portable_torch210_cu128)."""
+    py_path = get_python_path(context)
+    if py_path:
+        py_dir = py_path if os.path.isdir(py_path) else os.path.dirname(py_path)
+        py_parent = os.path.dirname(py_dir)
+        for cand in [py_parent, py_dir]:
+            if (os.path.exists(os.path.join(cand, "DepthAnything_CKPT")) or
+                os.path.exists(os.path.join(cand, "outputs"))):
+                return cand
+
+    addon_dir = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(addon_dir, "..", "Portable_torch210_cu128"),
+        os.path.join(addon_dir, "..", "..", "Portable_torch210_cu128"),
+        r"D:\_Code\Meu\CEB_MegaSam_prj\Portable_torch210_cu128",
+        os.path.join(addon_dir, "..", "Portable"),
+        os.path.join(addon_dir, "..", "..", "Portable"),
+        r"D:\_Code\Meu\CEB_MegaSam_prj\Portable",
+    ]
+    for c in candidates:
+        norm = os.path.normpath(c)
+        if os.path.isdir(norm):
+            return norm
+
+    if py_path:
+        py_dir = py_path if os.path.isdir(py_path) else os.path.dirname(py_path)
+        return os.path.dirname(py_dir) if os.path.basename(py_dir).lower().startswith("python") else py_dir
+
+    return addon_dir
+
+def get_depth_anything_ckpt(context=None, encoder="vits"):
+    """
+    Resolve the Depth-Anything checkpoint path.
+    Searches inside the portable Python folder under DepthAnything_CKPT.
+    """
+    portable_root = get_portable_root(context)
+    candidates = [
+        os.path.join(portable_root, "DepthAnything_CKPT", "checkpoints", f"depth_anything_{encoder}14.pth"),
+        os.path.join(portable_root, "DepthAnything_CKPT", f"depth_anything_{encoder}14.pth"),
+        os.path.join(portable_root, "checkpoints", f"depth_anything_{encoder}14.pth"),
+    ]
+    for c in candidates:
+        norm = os.path.normpath(c)
+        if os.path.isfile(norm):
+            return norm
+
+    # Recursive search inside DepthAnything_CKPT
+    ckpt_dir = os.path.join(portable_root, "DepthAnything_CKPT")
+    if os.path.isdir(ckpt_dir):
+        for root, _, files in os.walk(ckpt_dir):
+            for f in files:
+                if f.startswith(f"depth_anything_{encoder}") and f.endswith(".pth"):
+                    return os.path.join(root, f)
+
+    # Fallback to repo_root
+    repo_root = get_megasam_root(context)
+    if repo_root:
+        legacy = os.path.join(repo_root, "Depth-Anything", "checkpoints", f"depth_anything_{encoder}14.pth")
+        if os.path.isfile(legacy):
+            return legacy
+
+    return ""
 
 def get_unique_scene_name(base_output_dir, base_name):
     """

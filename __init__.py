@@ -2,14 +2,14 @@ import os
 import glob
 import re
 import bpy
-from .utils import get_python_path, get_megasam_root, get_unique_scene_name
+from .utils import get_python_path, get_megasam_root, get_portable_root, get_depth_anything_ckpt, get_unique_scene_name
 from . import operators
 from . import panel
 
 bl_info = {
     "name": "CEB MegaSam",
     "author": "Carlos Barreto, Antigravity",
-    "version": (1, 3),
+    "version": (1, 4),
     "blender": (4, 4, 3),
     "location": "View3D > N-Panel > CEB",
     "description": "Run MegaSam pipeline from Blender with auto-detection, low-VRAM, and speed controls",
@@ -39,6 +39,7 @@ bl_info = {
 ## OK - reorganizar visual
 ## OK - update scale quando colocar video no VSE
 
+## OK - Ajuste do batch que estava faltando um frame para cada batch, report dado pelo Chris Wright
 
 
 class MegaSamPreferences(bpy.types.AddonPreferences):
@@ -53,7 +54,7 @@ class MegaSamPreferences(bpy.types.AddonPreferences):
     
     megasam_root_path: bpy.props.StringProperty(
         name="MegaSam Root",
-        description="Root folder of MegaSam (leave blank to auto-detect in same parent folder as portable Python)",
+        description="Root folder of MegaSam (leave blank to auto-detect inside addon folder)",
         default="",
         subtype='DIR_PATH'
     )
@@ -83,26 +84,38 @@ class MegaSamPreferences(bpy.types.AddonPreferences):
             else:
                 col.label(text="MegaSam root folder not found automatically", icon='ERROR')
 
+        # DepthAnything Checkpoints status
+        detected_ckpt = get_depth_anything_ckpt(context, "vits")
+        if detected_ckpt and os.path.exists(detected_ckpt):
+            ckpt_folder = os.path.dirname(detected_ckpt)
+            col.label(text=f"DepthAnything CKPT: {ckpt_folder}", icon='CHECKMARK')
+        else:
+            col.label(text="DepthAnything CKPT not found in portable Python", icon='INFO')
+
 def get_result_items(self, context):
     root = get_megasam_root(context)
-    if not root or not os.path.exists(root):
+    portable_root = get_portable_root(context)
+    if not root and not portable_root:
         return [('NONE', 'Root not set / found', 'Check preferences')]
     
-    portable_root = os.path.dirname(root)
-    
-    # Search locations across portable outputs project folders and legacy roots
-    search_paths = [
-        os.path.join(portable_root, "outputs"),
-        os.path.join(portable_root, "outputs", "*"),
-        os.path.join(portable_root, "outputs", "*", "outputs_cvd"),
-        os.path.join(portable_root, "outputs", "*", "outputs"),
-        os.path.join(root, "outputs_cvd"),
-        os.path.join(root, "outputs"),
-        os.path.join(root, "cvd_opt", "outputs_cvd"),
-        os.path.join(root, "mega-sam", "cvd_opt", "outputs_cvd"),
-        os.path.join(root, "mega-sam", "outputs_cvd"),
-        os.path.join(root, "mega-sam", "outputs")
-    ]
+    # Search locations across portable outputs project folders and addon roots
+    search_paths = []
+    if portable_root and os.path.exists(portable_root):
+        search_paths.extend([
+            os.path.join(portable_root, "outputs"),
+            os.path.join(portable_root, "outputs", "*"),
+            os.path.join(portable_root, "outputs", "*", "outputs_cvd"),
+            os.path.join(portable_root, "outputs", "*", "outputs"),
+        ])
+    if root and os.path.exists(root):
+        search_paths.extend([
+            os.path.join(root, "outputs_cvd"),
+            os.path.join(root, "outputs"),
+            os.path.join(root, "cvd_opt", "outputs_cvd"),
+            os.path.join(root, "mega-sam", "cvd_opt", "outputs_cvd"),
+            os.path.join(root, "mega-sam", "outputs_cvd"),
+            os.path.join(root, "mega-sam", "outputs")
+        ])
     
     files = []
     for sp in search_paths:
@@ -153,9 +166,8 @@ def update_video_info(self, context):
     # Automatically update scene name from video name
     old_scene_name = self.megasam_scene_name
     base_name = os.path.splitext(os.path.basename(path))[0]
-    repo_root = get_megasam_root(context)
-    if repo_root:
-        portable_root = os.path.dirname(repo_root)
+    portable_root = get_portable_root(context)
+    if portable_root:
         output_root = os.path.join(portable_root, "outputs")
         self.megasam_scene_name = get_unique_scene_name(output_root, base_name)
     else:
@@ -236,6 +248,14 @@ def update_res_preset(self, context):
         except ValueError:
             pass
 
+def update_use_frame_range(self, context):
+    if self.megasam_use_frame_range and getattr(self, "megasam_use_timeline_range", False):
+        self.megasam_use_timeline_range = False
+
+def update_use_timeline_range(self, context):
+    if self.megasam_use_timeline_range and getattr(self, "megasam_use_frame_range", False):
+        self.megasam_use_frame_range = False
+
 def register():
     try:
         bpy.utils.register_class(MegaSamPreferences)
@@ -306,7 +326,14 @@ def register():
     bpy.types.Scene.megasam_use_frame_range = bpy.props.BoolProperty(
         name="Process Frame Range",
         description="Process only a specific range of frames instead of the entire video",
-        default=False
+        default=False,
+        update=update_use_frame_range
+    )
+    bpy.types.Scene.megasam_use_timeline_range = bpy.props.BoolProperty(
+        name="Use Current Frame Range",
+        description="Directly use current Blender timeline Start and End frames without copying",
+        default=False,
+        update=update_use_timeline_range
     )
     bpy.types.Scene.megasam_start_frame = bpy.props.IntProperty(
         name="Start Frame",
@@ -511,6 +538,7 @@ def unregister():
         "megasam_video_width", "megasam_video_height", "megasam_video_frames",
         "megasam_vram_preset",
         "megasam_res_preset", "megasam_target_width", "megasam_use_frame_range",
+        "megasam_use_timeline_range",
         "megasam_start_frame", "megasam_end_frame", "megasam_low_vram",
         "megasam_stride", "megasam_frontend_iters", "megasam_backend_iters",
         "megasam_buffer", "megasam_keyframe_thresh", "megasam_depth_encoder",

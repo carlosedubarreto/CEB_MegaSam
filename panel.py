@@ -1,6 +1,6 @@
 import bpy
 import os
-from .utils import get_python_path, get_megasam_root
+from .utils import get_python_path, get_megasam_root, get_depth_anything_ckpt
 
 class VIEW3D_PT_megasam_panel(bpy.types.Panel):
     """Main panel for CEB MegaSam containing primary workflow controls."""
@@ -46,14 +46,43 @@ class VIEW3D_PT_megasam_panel(bpy.types.Panel):
 
         layout.separator()
 
-        # 3. Main Run Pipeline Button
+        # 3. Frame Range Section
+        tbox = layout.box()
+        tbox.label(text="Frame Range", icon='TIME')
+
+        row = tbox.row(align=True)
+        sub_trim = row.row(align=True)
+        if scene.megasam_use_timeline_range:
+            sub_trim.scale_x = 0.75
+        sub_trim.prop(scene, "megasam_use_frame_range", text="Trim", toggle=True)
+
+        if scene.megasam_use_timeline_range:
+            current_btn_text = f"Current ({scene.frame_start} - {scene.frame_end})"
+        else:
+            current_btn_text = "Current"
+        row.prop(scene, "megasam_use_timeline_range", text=current_btn_text, toggle=True)
+
+        if scene.megasam_use_frame_range:
+            r = tbox.row(align=True)
+            r.prop(scene, "megasam_start_frame", text="Start")
+            r.prop(scene, "megasam_end_frame", text="End")
+            if scene.megasam_end_frame > scene.megasam_start_frame:
+                frame_count = scene.megasam_end_frame - scene.megasam_start_frame
+                tbox.label(text=f"{frame_count} frames", icon='INFO')
+        elif scene.megasam_use_timeline_range:
+            timeline_frames = max(0, scene.frame_end - scene.frame_start + 1) if scene.frame_end >= scene.frame_start else 0
+            tbox.label(text=f"{timeline_frames} frames", icon='INFO')
+
+        layout.separator()
+
+        # 4. Main Run Pipeline Button
         col = layout.column(align=True)
         col.scale_y = 1.4
         col.operator("megasam.run_pipeline", icon='PLAY', text="Run MegaSam Pipeline")
 
         layout.separator()
 
-        # 4. Results & Quick Import Section
+        # 5. Results & Quick Import Section
         rbox = layout.box()
         rbox.label(text="Results", icon='FILE_TICK')
         rbox.prop(scene, "megasam_output_filter", expand=True)
@@ -102,28 +131,15 @@ class VIEW3D_PT_megasam_optimization(bpy.types.Panel):
 
         layout.separator()
 
-        # Frame Range Trimming
-        col = layout.column(align=True)
-        col.prop(scene, "megasam_use_frame_range", text="Trim Frame Range")
-        if scene.megasam_use_frame_range:
-            row = col.row(align=True)
-            row.prop(scene, "megasam_start_frame", text="Start")
-            row.prop(scene, "megasam_end_frame", text="End")
-            col.operator("megasam.set_range_from_timeline", icon='TIME', text="From Blender Timeline")
-
-            if scene.megasam_end_frame > scene.megasam_start_frame:
-                frame_count = scene.megasam_end_frame - scene.megasam_start_frame
-                col.label(text=f"Processing {frame_count} frames", icon='INFO')
-
-        layout.separator()
-
         # Batch Processing
         col = layout.column(align=True)
         col.prop(scene, "megasam_use_batch", text="Enable Batching (Low VRAM)")
         if scene.megasam_use_batch:
             col.prop(scene, "megasam_batch_size", text="Batch Size")
             total_f = scene.megasam_video_frames
-            if scene.megasam_use_frame_range and scene.megasam_end_frame > scene.megasam_start_frame:
+            if scene.megasam_use_timeline_range and scene.frame_end > scene.frame_start:
+                total_f = scene.frame_end - scene.frame_start + 1
+            elif scene.megasam_use_frame_range and scene.megasam_end_frame > scene.megasam_start_frame:
                 total_f = scene.megasam_end_frame - scene.megasam_start_frame
 
             if total_f > 0 and scene.megasam_batch_size > 0:
@@ -133,25 +149,18 @@ class VIEW3D_PT_megasam_optimization(bpy.types.Panel):
         layout.separator()
         layout.prop(scene, "megasam_low_vram", text="CUDA Memory Allocator Opt")
 
-        # Advanced SLAM (DROID) foldout
+        # Advanced SLAM (DROID) Settings
         layout.separator()
         adv_box = layout.box()
-        adv_box.prop(
-            scene,
-            "megasam_show_advanced",
-            icon='TRIA_DOWN' if scene.megasam_show_advanced else 'TRIA_RIGHT',
-            text="Advanced SLAM (DROID) Settings",
-            emboss=False
-        )
-        if scene.megasam_show_advanced:
-            acol = adv_box.column(align=True)
-            acol.prop(scene, "megasam_stride", text="Tracking Stride")
-            if scene.megasam_stride > 1:
-                acol.label(text=f"Tracks every {scene.megasam_stride} frames (50-65% faster)", icon='INFO')
-            acol.prop(scene, "megasam_frontend_iters", text="Frontend BA Iters")
-            acol.prop(scene, "megasam_backend_iters", text="Backend BA Iters")
-            acol.prop(scene, "megasam_buffer", text="Keyframe Buffer")
-            acol.prop(scene, "megasam_keyframe_thresh", text="Keyframe Thresh")
+        adv_box.label(text="Advanced SLAM (DROID) Settings", icon='TRACKER')
+        acol = adv_box.column(align=True)
+        acol.prop(scene, "megasam_stride", text="Tracking Stride")
+        if scene.megasam_stride > 1:
+            acol.label(text=f"Tracks every {scene.megasam_stride} frames (50-65% faster)", icon='INFO')
+        acol.prop(scene, "megasam_frontend_iters", text="Frontend BA Iters")
+        acol.prop(scene, "megasam_backend_iters", text="Backend BA Iters")
+        acol.prop(scene, "megasam_buffer", text="Keyframe Buffer")
+        acol.prop(scene, "megasam_keyframe_thresh", text="Keyframe Thresh")
 
 
 class VIEW3D_PT_megasam_import_settings(bpy.types.Panel):
@@ -274,6 +283,14 @@ class VIEW3D_PT_megasam_environment(bpy.types.Panel):
                 col.label(text=f"MegaSam: {os.path.basename(auto_root)}", icon='CHECKMARK')
             else:
                 col.label(text="MegaSam root not found", icon='ERROR')
+
+        col.separator()
+        enc = context.scene.megasam_depth_encoder if hasattr(context.scene, "megasam_depth_encoder") else "vits"
+        depth_ckpt = get_depth_anything_ckpt(context, enc)
+        if depth_ckpt and os.path.exists(depth_ckpt):
+            col.label(text=f"Depth CKPT: {os.path.basename(depth_ckpt)}", icon='CHECKMARK')
+        else:
+            col.label(text="Depth CKPT not found", icon='ERROR')
 
 
 classes = (

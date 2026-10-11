@@ -3,7 +3,7 @@ import os
 import subprocess
 import numpy as np
 import mathutils
-from .utils import get_python_path, get_megasam_root, get_unique_scene_name
+from .utils import get_python_path, get_megasam_root, get_portable_root, get_depth_anything_ckpt, get_unique_scene_name
 
 class MEGASAM_OT_set_range_from_timeline(bpy.types.Operator):
     bl_idname = "megasam.set_range_from_timeline"
@@ -72,7 +72,7 @@ class MEGASAM_OT_run_pipeline(bpy.types.Operator):
             self.report({'ERROR'}, f"Video file path is invalid or file does not exist: {video_path}")
             return {'CANCELLED'}
             
-        portable_root = os.path.dirname(repo_root)
+        portable_root = get_portable_root(context)
         output_root = os.path.join(portable_root, "outputs")
         
         # Use user-provided scene name or fallback to video filename
@@ -91,6 +91,7 @@ class MEGASAM_OT_run_pipeline(bpy.types.Operator):
             "-v", video_path,
             "-s", scene_name,
             "-o", output_root,
+            "--portable_root", portable_root,
             "-w", str(scene.megasam_target_width),
             "--depth_encoder", scene.megasam_depth_encoder,
             "--stride", str(scene.megasam_stride),
@@ -99,16 +100,38 @@ class MEGASAM_OT_run_pipeline(bpy.types.Operator):
             "--frontend_iters", str(scene.megasam_frontend_iters),
             "--backend_iters", str(scene.megasam_backend_iters)
         ]
+
+        # Explicitly pass DepthAnything checkpoint if resolved from DepthAnything_CKPT
+        depth_ckpt = get_depth_anything_ckpt(context, scene.megasam_depth_encoder)
+        if depth_ckpt:
+            command.extend(["--depth_anything_weights", depth_ckpt])
         
         if scene.megasam_skip_cvd:
             command.append("--skip_cvd")
         else:
             command.extend(["--cvd_iters", str(scene.megasam_cvd_iters)])
         
-        if scene.megasam_use_frame_range:
-            command.extend(["--start_frame", str(scene.megasam_start_frame)])
-            if scene.megasam_end_frame > scene.megasam_start_frame:
-                command.extend(["--end_frame", str(scene.megasam_end_frame)])
+        if scene.megasam_use_timeline_range:
+            t_start = max(0, scene.frame_start)
+            t_end = max(t_start, scene.frame_end)
+            # Blender timeline is 1-based and inclusive [t_start, t_end].
+            # When mapping to 0-based video frames [v_start, v_end):
+            # If timeline starts at >= 1 (e.g. 1..200), video frames are [t_start - 1, t_end) -> [0, 200), exactly 200 frames.
+            if scene.frame_start >= 1:
+                v_start = scene.frame_start - 1
+                v_end = scene.frame_end
+            else:
+                v_start = t_start
+                v_end = t_end
+            command.extend(["--start_frame", str(v_start)])
+            if v_end >= v_start:
+                command.extend(["--end_frame", str(v_end)])
+        elif scene.megasam_use_frame_range:
+            v_start = max(0, scene.megasam_start_frame)
+            v_end = max(v_start, scene.megasam_end_frame)
+            command.extend(["--start_frame", str(v_start)])
+            if v_end >= v_start:
+                command.extend(["--end_frame", str(v_end)])
         
         if scene.megasam_use_batch:
             command.extend(["--batch_size", str(scene.megasam_batch_size)])
@@ -153,7 +176,15 @@ class MEGASAM_OT_import_result(bpy.types.Operator):
             # Extract scene name from filename
             filename = os.path.basename(selected_path)
             scene_name = filename.replace("_sgd_cvd_hr.npz", "").replace("_droid.npz", "").replace(".npz", "")
-            start_frame = scene.megasam_start_frame if scene.megasam_use_frame_range else 0
+            if scene.megasam_use_timeline_range:
+                start_frame = max(0, scene.frame_start)
+                user_end_frame = scene.frame_end
+            elif scene.megasam_use_frame_range:
+                start_frame = scene.megasam_start_frame
+                user_end_frame = scene.megasam_end_frame if scene.megasam_end_frame > 0 else None
+            else:
+                start_frame = 0
+                user_end_frame = None
 
             # 1. Load Data
             data = self.load_cvd_data(selected_path)
@@ -170,10 +201,10 @@ class MEGASAM_OT_import_result(bpy.types.Operator):
                 self.cleanup_scene(scene, scene_name=scene_name)
             
             # 3. Setup Camera
-            cam_obj = self.setup_camera(data, context, scene_name, start_frame=start_frame, stride=stride)
+            cam_obj = self.setup_camera(data, context, scene_name, start_frame=start_frame, stride=stride, user_end_frame=user_end_frame)
             
             # 4. Create Point Cloud
-            pc_obj = self.create_animated_point_cloud(data, context, scene_name, start_frame=start_frame, stride=stride)
+            pc_obj = self.create_animated_point_cloud(data, context, scene_name, start_frame=start_frame, stride=stride, user_end_frame=user_end_frame)
             
             # 5. Parent to Empty (if requested)
             if scene.megasam_import_parent_to_empty:
@@ -191,7 +222,8 @@ class MEGASAM_OT_import_result(bpy.types.Operator):
                     pc_obj.matrix_parent_inverse = empty_obj.matrix_world.inverted()
             
             num_f = data['images'].shape[0]
-            end_f = start_frame + (num_f - 1) * stride
+            calculated_end = start_frame + (num_f - 1) * stride
+            end_f = min(calculated_end, user_end_frame) if (user_end_frame is not None and user_end_frame >= start_frame) else calculated_end
             self.report({'INFO'}, f"Imported: {os.path.basename(selected_path)} (Frames: {num_f}, Stride: {stride} -> Timeline: {start_frame}..{end_f})")
             return {'FINISHED'}
         except Exception as e:
@@ -228,7 +260,7 @@ class MEGASAM_OT_import_result(bpy.types.Operator):
     def get_world_transform(self):
         return mathutils.Matrix.Rotation(np.radians(-90), 4, 'X')
 
-    def setup_camera(self, data, context, scene_name, start_frame=0, stride=1):
+    def setup_camera(self, data, context, scene_name, start_frame=0, stride=1, user_end_frame=None):
         world_transform = self.get_world_transform()
         cam_name = f"Cam_{scene_name}"
         cam_data = bpy.data.cameras.new(cam_name)
@@ -238,9 +270,12 @@ class MEGASAM_OT_import_result(bpy.types.Operator):
         K, images = data['intrinsic'], data['images']
         num_frames, H, W, _ = images.shape
         
+        calculated_end = start_frame + (num_frames - 1) * stride
+        effective_end = min(calculated_end, user_end_frame) if (user_end_frame is not None and user_end_frame >= start_frame) else calculated_end
+        
         context.scene.render.resolution_x, context.scene.render.resolution_y = W, H
         context.scene.frame_start = start_frame
-        context.scene.frame_end = start_frame + (num_frames - 1) * stride
+        context.scene.frame_end = effective_end
         
         cam_data.lens_unit = 'FOV'
         cam_data.sensor_fit = 'HORIZONTAL'
@@ -253,13 +288,16 @@ class MEGASAM_OT_import_result(bpy.types.Operator):
         
         cv_to_blender_local = mathutils.Matrix(((1,0,0,0),(0,-1,0,0),(0,0,-1,0),(0,0,0,1)))
         for f in range(num_frames):
+            timeline_frame = start_frame + f * stride
+            if user_end_frame is not None and timeline_frame > user_end_frame:
+                break
             c2w = mathutils.Matrix(data['cam_c2w'][f])
             cam_obj.matrix_world = world_transform @ c2w @ cv_to_blender_local
-            cam_obj.keyframe_insert(data_path="location", frame=start_frame + f * stride)
-            cam_obj.keyframe_insert(data_path="rotation_euler", frame=start_frame + f * stride)
+            cam_obj.keyframe_insert(data_path="location", frame=timeline_frame)
+            cam_obj.keyframe_insert(data_path="rotation_euler", frame=timeline_frame)
         return cam_obj
 
-    def create_animated_point_cloud(self, data, context, scene_name, start_frame=0, stride=1):
+    def create_animated_point_cloud(self, data, context, scene_name, start_frame=0, stride=1, user_end_frame=None):
         scene = context.scene
         world_transform = self.get_world_transform()
         
@@ -282,6 +320,9 @@ class MEGASAM_OT_import_result(bpy.types.Operator):
         all_pts, all_cols, all_f_ids = [], [], []
         
         for f in range(0, num_frames, frame_step):
+            timeline_frame = start_frame + f * stride
+            if user_end_frame is not None and timeline_frame > user_end_frame:
+                break
             depth, image, c2w = depths[f], images[f], mathutils.Matrix(c2ws[f])
             u, v = np.meshgrid(np.arange(0, W, pixel_step), np.arange(0, H, pixel_step))
             z = depth[v, u].flatten()
@@ -297,7 +338,7 @@ class MEGASAM_OT_import_result(bpy.types.Operator):
             pts_cam = np.stack([(uu-cx)*z/fx, (vv-cy)*z/fy, z, np.ones_like(z)], axis=-1)
             all_pts.append((pts_cam @ (world_transform @ c2w).transposed())[:, :3])
             all_cols.append(image[vv, uu] / 255.0)
-            all_f_ids.append(np.full(len(z), start_frame + f * stride, dtype=np.float32))
+            all_f_ids.append(np.full(len(z), timeline_frame, dtype=np.float32))
 
         if not all_pts:
             self.report({'WARNING'}, "No points generated with current settings.")
@@ -453,7 +494,12 @@ class MEGASAM_OT_generate_mesh(bpy.types.Operator):
             
         # 3. Define output path and map timeline frame to NPZ frame index
         frame = context.scene.frame_current
-        start_frame = scene.megasam_start_frame if scene.megasam_use_frame_range else 0
+        if scene.megasam_use_timeline_range:
+            start_frame = max(0, scene.frame_start)
+        elif scene.megasam_use_frame_range:
+            start_frame = scene.megasam_start_frame
+        else:
+            start_frame = 0
         stride = scene.megasam_stride if scene.megasam_stride >= 1 else 1
         npz_frame = max(0, round((frame - start_frame) / stride))
         
@@ -527,7 +573,7 @@ class MEGASAM_OT_open_outputs_folder(bpy.types.Operator):
             self.report({'ERROR'}, "MegaSam root folder not found")
             return {'CANCELLED'}
             
-        portable_root = os.path.dirname(repo_root)
+        portable_root = get_portable_root(context)
         scene_name = context.scene.megasam_scene_name.strip()
         project_folder = os.path.join(portable_root, "outputs", scene_name) if scene_name else os.path.join(portable_root, "outputs")
         
@@ -773,7 +819,7 @@ class MEGASAM_OT_load_video_vse(bpy.types.Operator):
                 base_name = os.path.splitext(os.path.basename(path))[0]
                 repo_root = get_megasam_root(context)
                 if repo_root:
-                    portable_root = os.path.dirname(repo_root)
+                    portable_root = get_portable_root(context)
                     output_root = os.path.join(portable_root, "outputs")
                     scene.megasam_scene_name = get_unique_scene_name(output_root, base_name)
                 else:
@@ -807,7 +853,12 @@ class MEGASAM_OT_load_video_vse(bpy.types.Operator):
 
             # 4. Load movie strip
             strip_name = os.path.basename(path)
-            start_frame = scene.megasam_start_frame if scene.megasam_use_frame_range and scene.megasam_start_frame > 0 else 1
+            if scene.megasam_use_timeline_range:
+                start_frame = max(1, scene.frame_start)
+            elif scene.megasam_use_frame_range and scene.megasam_start_frame > 0:
+                start_frame = scene.megasam_start_frame
+            else:
+                start_frame = 1
             
             added_movie_strip = None
             if vse_area:
